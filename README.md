@@ -40,9 +40,10 @@ a specific answer here, and each is covered by a test.
 
 ## What it guarantees
 
-**A notification is never accepted without being sent, and never sent twice.**
+**An accepted notification is never lost, and a delivery the provider confirmed is never retried.**
 
-That sentence is doing a lot of work, so here is how each half is paid for.
+That sentence is doing a lot of work, so here is how each half is paid for, and exactly
+where it stops.
 
 *Never lost.* The notification row and its outbox row are written in one transaction. If
 the process dies immediately after the commit, the outbox row is still there and the next
@@ -50,17 +51,29 @@ poll publishes it. If the transaction rolls back, neither exists and nothing was
 promised to the caller. There is no window in which the API has returned `202` but no
 Kafka message is owed.
 
-*Never duplicated.* Kafka is at-least-once, so redelivery is normal, not exceptional.
-Before calling a provider, the consumer checks whether the notification has already
-reached a terminal state and skips it if so. On the inbound side, an `Idempotency-Key`
-header is claimed in Ignite with a single atomic `getAndPutIfAbsent`; the unique
-constraint on `notification.idempotency_key` is the durable backstop, so losing the cache
-costs a database round trip rather than correctness. That is not a theoretical claim —
-see [Losing the cache](#losing-the-cache).
+*Not duplicated.* Kafka is at-least-once, so redelivery is normal, not exceptional.
+Three things stop it turning into a second message:
 
-The honest caveat: the outbox gives *at-least-once* publication. A crash between a
-successful Kafka send and the status update will republish. That is exactly why the
-consumer-side terminal-status check exists.
+- **Before sending**, the consumer skips any notification that has already reached a
+  terminal state (`SENT`, `SUPPRESSED`, `DEAD_LETTERED`).
+- **After sending**, nothing is retried. Once the provider accepts a message, a failure
+  to record `SENT` is logged with the provider's message id and *not* rethrown, because
+  rethrowing would make Kafka redeliver and the user would get it twice.
+- **On the way in**, an `Idempotency-Key` header is claimed in Ignite with a single atomic
+  `getAndPutIfAbsent`. Keys are scoped to the user (stored as `userId:key`), so two
+  callers who both pick `order-42` never see each other's notifications. The unique
+  constraint on `notification.idempotency_key` is the durable backstop, so losing the
+  cache costs a database round trip rather than correctness (see
+  [Losing the cache](#losing-the-cache)).
+
+The honest caveat: this is *at-least-once with de-duplication*, not exactly-once. Two
+windows remain, and both are closed in production by passing the notification id to the
+vendor as its own idempotency key:
+
+- The outbox can republish an event if the process dies between the Kafka ack and the
+  status update. The consumer's terminal-status check absorbs this in the normal case.
+- If the process dies after the provider accepted a message but before `SENT` was
+  written, the redelivered message is sent again.
 
 ## Failure handling
 
@@ -72,6 +85,8 @@ consumer-side terminal-status check exists.
 | Kafka unreachable | Outbox rows stay `PENDING` and retry on the next poll; parked as `FAILED` after 10 attempts |
 | Ignite down | Engine keeps running: de-duplication falls back to the database constraint, rate limiting fails open |
 | Postgres down | Requests fail fast with 500; nothing is half-written |
+| Status write fails after a successful send | Logged with the provider message id and **not** retried, so the user is never messaged twice |
+| A duplicate copy of a message is dead-lettered after another copy was delivered | Ignored: `DEAD_LETTERED` never overwrites `SENT` |
 
 Retries are blocking, per-partition. That is a deliberate trade for ordering: a stuck
 message delays later messages *for that partition*, and the non-retryable classification
@@ -142,7 +157,9 @@ curl "http://localhost:8080/api/v1/notifications?status=DEAD_LETTERED"
 ```
 
 Replaying the same `Idempotency-Key` returns `200` with `"duplicate": true` and the
-original notification, rather than `202` and a second send.
+original notification, rather than `202` and a second send. The replay check runs
+*before* rate limiting, so a client retrying after a timeout gets its answer instead of a
+`429`, and the retry does not spend quota.
 
 ## API
 
@@ -154,17 +171,18 @@ original notification, rather than `202` and a second send.
 | `GET` | `/api/v1/notifications/{id}/attempts` | Per-attempt history, including retry errors |
 | `GET`/`PUT` | `/api/v1/users/{userId}/preferences` | |
 | `GET`/`PUT`/`DELETE` | `/api/v1/templates` | |
-| `GET` | `/actuator/health`, `/actuator/prometheus` | |
+| `GET` | `/actuator/health`, `/actuator/metrics` | |
 
 Errors carry a stable machine-readable `code`:
 
 | Status | Code | Meaning |
 |---|---|---|
-| 400 | `VALIDATION_FAILED` / `MALFORMED_REQUEST` | Bad field, or a body that will not parse |
+| 400 | `VALIDATION_FAILED` / `MALFORMED_REQUEST` / `BAD_REQUEST` | Bad field, a body that will not parse, or an `Idempotency-Key` over 64 characters |
 | 404 | `NOT_FOUND` | No such notification or template |
 | 409 | `DUPLICATE_IN_FLIGHT` | Same idempotency key, first request not committed yet — retry |
 | 422 | `UNPROCESSABLE` / `TEMPLATE_RENDER_FAILED` | Nowhere to deliver, or a missing template variable |
 | 429 | `RATE_LIMITED` | Over quota; carries `Retry-After` |
+| 405, 415, … | e.g. `METHOD_NOT_ALLOWED`, `UNSUPPORTED_MEDIA_TYPE` | Spring's own client errors keep their real status (and headers such as `Allow`) instead of becoming a `500` |
 
 `429` responses always set `Retry-After` to at least 1 second, so a client backing off on
 that header cannot end up in a hot loop.
@@ -233,12 +251,17 @@ of the cache is survivable rather than fatal:
   `"duplicate": true`.
 - **Rate limiting fails open.** Quotas stop being enforced; notifications keep flowing.
   The trade-off is deliberate, and it is why the health check matters.
-- **Health reports `OUT_OF_SERVICE`, not `DOWN`.** The instance is still doing its job, so
-  a load balancer should not pull it from rotation — but the degradation is visible:
+- **Health stays `UP`, flagged as degraded.** Spring Boot answers both `DOWN` and
+  `OUT_OF_SERVICE` with HTTP 503, and a load balancer would then pull *every* instance out
+  of rotation at once over a cache the engine can run without. So the status stays `UP`
+  and the degradation is carried in the Ignite component's details (visible to authorized
+  callers, per `management.endpoint.health.show-details`), where monitoring can alert on it:
 
   ```json
-  { "status": "OUT_OF_SERVICE",
-    "details": { "impact": "de-duplication falls back to the database; rate limiting is off" } }
+  { "status": "UP",
+    "components": { "ignite": { "status": "UP",
+      "details": { "degraded": true,
+                   "impact": "de-duplication falls back to the database; rate limiting is off" } } } }
   ```
 
 This was verified by stopping the Ignite container with the engine running: it kept
@@ -302,49 +325,73 @@ java --add-opens=java.base/java.nio=ALL-UNNAMED \
 ```
 
 Without them the thin client dies at startup with an `InaccessibleObjectException`. This
-applies to the thin client too, not just an embedded server node.
+applies to the thin client too, not just an embedded server node. The Ignite *server*
+container in `docker-compose.yml` passes a longer list, because a server node reaches
+into more of the JDK than the client does.
 
 ## Tests
 
 ```bash
-./mvnw test              # 160 unit tests, no Docker required
-./scripts/verify.sh      # 19 end-to-end checks against a running stack
+./mvnw test              # unit tests, no Docker required
+./scripts/verify.sh      # end-to-end checks against a running stack
 ```
 
-`scripts/verify.sh` drives the real HTTP API and asserts on the behaviour that matters —
+`scripts/verify.sh` drives the real HTTP API and asserts on the behaviour that matters:
 a send reaching `SENT`, a replayed `Idempotency-Key` returning the original, SMS
 throttling on the sixth request, suppression by opt-out and quiet hours, and the error
 codes. It exits non-zero on the first failure and prints the server's response, so it
 works as a CI gate as well as a local smoke test.
 
-160 unit tests, no Docker required — every dependency is mocked or supplied by a fixed `Clock`,
-so the suite runs in CI without infrastructure.
-
-They target the decisions rather than the getters: the rate limiter fails open when the
-cache throws, the CAS loop retries when a concurrent request wins the race, the window's
-expiry is never extended by an increment, the ingest path releases its idempotency claim
-when rendering fails, `markPublished` refuses to walk a `SENT` notification back to
-`PUBLISHED`, quiet hours handle windows that wrap midnight, and a redelivered message for
-an already-sent notification calls no provider. Several real defects surfaced this way — a
-malformed request body returning `500` instead of `400`, and a `smallint`/`integer`
-mismatch between the migration and the entity.
-
-End-to-end behaviour was verified against real Postgres, Ignite, and Kafka: a full send
-reaching `SENT`, an idempotent replay returning the original, SMS throttling at the sixth
-request in a window, suppression by opt-out and by quiet hours, a transient failure
-dead-lettering after exactly 4 attempts, a permanent failure dead-lettering after 1, and
-the whole degraded-cache path described above.
+The unit tests need no infrastructure: every dependency is mocked or supplied by a fixed
+`Clock`. They target the decisions rather than the getters: the rate limiter fails open
+when the cache throws, the CAS loop retries when a concurrent request wins the race, the
+window's expiry is never extended by an increment, the ingest path releases its
+idempotency claim on every failure (including a rejected insert), keys from different
+users never collide, a replay is answered even when the caller is over quota, a delivery
+the provider accepted is never retried, `DEAD_LETTERED` never overwrites `SENT`, the
+outbox poll claims its rows inside a transaction, quiet hours handle windows that wrap
+midnight, and Spring's own 4xx errors are not reported as `500`.
 
 ## Scaling notes
 
 Every node runs the outbox poller; `FOR UPDATE SKIP LOCKED` means concurrent pollers take
-disjoint batches rather than fighting over rows or double-publishing. Channel consumers
+disjoint batches rather than fighting over rows or double-publishing. Row locks only last
+as long as a transaction, so each poll opens one explicitly (`TransactionOperations`)
+around claim, publish and status update; a `@Transactional` method called from inside the
+same bean would bypass Spring's proxy and release the locks immediately. The cost is that
+the transaction, and its database connection, stay open while the batch is sent. Normally
+that is milliseconds; if Kafka is unreachable, each send can block for the producer's
+`max.block.ms` (60s by default) plus a 10s ack timeout, so keep
+`notification.outbox.batch-size` modest and lower `max.block.ms` in production.
+`markPublished` commits in its own short transaction, so it never holds the batch open;
+if it loses the `@Version` check to the consumer, the failure is ignored, and the consumer
+retries its `SENT` write up to three times. Channel consumers
 scale independently — a throttling SMS vendor cannot back up email or push. Messages are
 keyed by user id, so one user's notifications stay ordered within a channel; concurrency
 above the partition count just leaves consumers idle.
 
 The published `PUBLISHED` outbox rows are swept hourly
 (`notification.outbox.retention`, default 7 days) so the table does not grow without bound.
+
+## Known limitations
+
+Deliberate trade-offs, and the next things to build:
+
+- **At-least-once, not exactly-once.** See [What it guarantees](#what-it-guarantees) for
+  the two remaining windows; a vendor-side idempotency key closes both.
+- **A stuck outbox event can reorder a user's notifications.** A failed publish stays
+  `PENDING` while later events for the same user go out, and an event parked as `FAILED`
+  after 10 attempts leaves its notification `QUEUED` with no alert. A reconciliation job
+  and an alert on `FAILED` outbox rows would close this.
+- **Fixed-window rate limiting** can let up to twice the limit through across a window
+  boundary. A sliding window or token bucket would be stricter.
+- **The dead-letter auditor logs and skips database errors** instead of retrying them,
+  so a DB outage at that moment can leave a notification at `FAILED`.
+- **An in-flight idempotency claim outlives a crash.** If the process dies between the
+  claim and the commit, retries with that key get `409` until the claim's TTL expires.
+- **No integration tests yet.** Transaction boundaries and Kafka redelivery are exactly
+  what mocks cannot exercise; Testcontainers suites for Postgres and Kafka are the next
+  step.
 
 ## Layout
 

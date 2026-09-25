@@ -27,13 +27,16 @@ import org.springframework.stereotype.Service;
  *
  * <p>Order of operations is deliberate:
  * <ol>
- *   <li><b>Rate limit</b> first, so an abusive caller is rejected before any state is
- *       touched.</li>
- *   <li><b>Idempotency claim</b> second, so the claim is only spent on a request that
- *       will actually be processed. It is released if anything downstream fails.</li>
+ *   <li><b>Idempotency claim</b> first, so a client retrying a request that was already
+ *       accepted gets the original back instead of spending quota or being throttled.
+ *       Keys are scoped to the user: two users who both send {@code order-42} never see
+ *       each other's notifications.</li>
+ *   <li><b>Rate limit</b> second. A rejected request releases its claim, so the same key
+ *       works once the window resets.</li>
  *   <li><b>Preferences and rendering</b>, which can suppress or reject the request.</li>
  *   <li><b>One transaction</b> writing the notification and its outbox event.</li>
  * </ol>
+ * Every failure after the claim releases it, so an error never blocks a key for its TTL.
  */
 @Service
 public class NotificationIngestService {
@@ -72,17 +75,7 @@ public class NotificationIngestService {
 
     public IngestResult ingest(SendNotificationRequest request, String idempotencyKey) {
         Channel channel = request.channel();
-        String effectiveKey = idempotencyKey != null && !idempotencyKey.isBlank()
-                ? idempotencyKey
-                : UUID.randomUUID().toString();
-
-        RateLimiterService.Decision decision = rateLimiter.tryAcquire(request.userId(), channel);
-        if (!decision.allowed()) {
-            throw new RateLimitExceededException(
-                    "user %s exceeded %d %s notifications per window"
-                            .formatted(request.userId(), decision.limit(), channel),
-                    decision.limit(), decision.retryAfter());
-        }
+        String effectiveKey = scopedKey(request.userId(), idempotencyKey);
 
         UUID notificationId = UUID.randomUUID();
         Optional<UUID> existing = idempotency.claim(effectiveKey, notificationId);
@@ -91,19 +84,44 @@ public class NotificationIngestService {
         }
 
         try {
+            RateLimiterService.Decision decision = rateLimiter.tryAcquire(request.userId(), channel);
+            if (!decision.allowed()) {
+                throw new RateLimitExceededException(
+                        "user %s exceeded %d %s notifications per window"
+                                .formatted(request.userId(), decision.limit(), channel),
+                        decision.limit(), decision.retryAfter());
+            }
             return process(request, channel, notificationId, effectiveKey);
         } catch (DataIntegrityViolationException ex) {
-            // The cache lost the claim (eviction, restart) but the database remembered it.
-            // The unique constraint on idempotency_key is why this is a duplicate rather
-            // than a second delivery.
-            log.info("idempotency key {} already committed, returning the original", effectiveKey);
-            return notifications.findByIdempotencyKey(effectiveKey)
-                    .map(found -> new IngestResult(found, true))
-                    .orElseThrow(() -> ex);
+            // Either the cache lost the claim (eviction, restart) but the database
+            // remembered it, or some other constraint failed. The claim in the cache points
+            // at a notification id that was never written, so it is released either way.
+            idempotency.release(effectiveKey);
+            Optional<Notification> original = notifications.findByIdempotencyKey(effectiveKey);
+            if (original.isPresent()) {
+                // The unique constraint on idempotency_key is why this is a duplicate
+                // rather than a second delivery. Re-seed the cache with the original id so
+                // later replays are answered on the fast path, before the rate limiter.
+                idempotency.claim(effectiveKey, original.get().getId());
+                log.info("idempotency key {} already committed, returning the original", effectiveKey);
+                return new IngestResult(original.get(), true);
+            }
+            throw ex;
         } catch (RuntimeException ex) {
             idempotency.release(effectiveKey);
             throw ex;
         }
+    }
+
+    /**
+     * Namespaces the caller's key by user, so a key only ever matches the same user's
+     * earlier request. A request without a key gets a random one and is never de-duplicated.
+     */
+    static String scopedKey(String userId, String idempotencyKey) {
+        String key = idempotencyKey != null && !idempotencyKey.isBlank()
+                ? idempotencyKey
+                : UUID.randomUUID().toString();
+        return userId + ":" + key;
     }
 
     private IngestResult process(SendNotificationRequest request,

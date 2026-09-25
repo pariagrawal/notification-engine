@@ -12,9 +12,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.FieldError;
+import org.springframework.web.ErrorResponse;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -94,8 +96,24 @@ public class GlobalExceptionHandler {
                 .body(ApiError.of(400, "VALIDATION_FAILED", "request validation failed"));
     }
 
+    /**
+     * Last resort. Spring's own client errors (unsupported media type, wrong method,
+     * missing parameter, unknown path, and {@code ResponseStatusException}) implement
+     * {@link ErrorResponse} and carry their real status; they are the caller's mistake,
+     * not a 500, and keep headers such as {@code Allow}.
+     */
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ApiError> handleUnexpected(Exception ex) {
+        if (ex instanceof ErrorResponse framework && framework.getStatusCode().is4xxClientError()) {
+            HttpStatusCode status = framework.getStatusCode();
+            HttpStatus known = HttpStatus.resolve(status.value());
+            String detail = framework.getBody().getDetail();
+            String message = detail != null ? detail : known != null ? known.getReasonPhrase() : "request rejected";
+            log.debug("rejecting request with {}: {}", status.value(), message);
+            return ResponseEntity.status(status)
+                    .headers(framework.getHeaders())
+                    .body(ApiError.of(status.value(), known != null ? known.name() : "CLIENT_ERROR", message));
+        }
         log.error("unhandled error serving request", ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(ApiError.of(500, "INTERNAL_ERROR", "something went wrong"));

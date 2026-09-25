@@ -16,7 +16,10 @@ public record PreferenceRequest(
         @NotNull
         Channel channel,
 
-        boolean enabled,
+        // A Boolean, not a boolean: with a primitive, a body that simply left the field out
+        // would bind to false and silently opt the user out of the channel.
+        @NotNull
+        Boolean enabled,
 
         @Size(max = 320)
         String destination,

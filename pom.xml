@@ -43,9 +43,9 @@
 		</dependency>
 
 		<!-- Apache Ignite thin client. Deliberately the thin client and not an embedded
-		     node: it keeps the JVM free of Ignite's server-side internals (and the JPMS
-		     add-opens flags a 2.x server node needs on modern JDKs), and lets the cache
-		     outlive an application restart. -->
+		     node: it keeps the JVM free of Ignite's server-side internals, needs only the
+		     three add-opens flags below instead of a server node's longer list, and lets
+		     the cache outlive an application restart. -->
 		<dependency>
 			<groupId>org.apache.ignite</groupId>
 			<artifactId>ignite-core</artifactId>

@@ -21,6 +21,7 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -31,6 +32,8 @@ import org.mockito.quality.Strictness;
 import org.springframework.kafka.KafkaException;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
+import org.springframework.transaction.support.TransactionCallback;
+import org.springframework.transaction.support.TransactionOperations;
 
 @ExtendWith(MockitoExtension.class)
 @MockitoSettings(strictness = Strictness.LENIENT)
@@ -54,7 +57,7 @@ class OutboxPublisherTest {
         properties.getOutbox().setBatchSize(50);
         properties.getOutbox().setMaxAttempts(3);
         publisher = new OutboxPublisher(outbox, kafkaTemplate, deliveryService, properties,
-                Clock.fixed(NOW, ZoneOffset.UTC));
+                Clock.fixed(NOW, ZoneOffset.UTC), TransactionOperations.withoutTransaction());
     }
 
     private OutboxEvent event(int attemptsSoFar) {
@@ -176,5 +179,50 @@ class OutboxPublisherTest {
 
         assertThat(recovered.getLastError()).isNull();
         verify(deliveryService).markPublished(eq(recovered.getAggregateId()));
+    }
+
+    @Test
+    void aFailedStatusUpdateAfterTheSendStillCountsAsPublished() {
+        // The event is already on Kafka; treating this as a failed publish would send it again.
+        OutboxEvent pending = event(0);
+        when(outbox.claimPendingBatch(anyInt())).thenReturn(List.of(pending));
+        sendSucceeds();
+        org.mockito.Mockito.doThrow(new IllegalStateException("optimistic lock"))
+                .when(deliveryService).markPublished(any());
+
+        assertThat(publisher.drainOnce()).isEqualTo(1);
+
+        assertThat(pending.getStatus()).isEqualTo(OutboxStatus.PUBLISHED);
+        assertThat(pending.getAttempts()).isZero();
+    }
+
+    @Test
+    void theScheduledTickClaimsInsideATransactionSoTheRowLocksAreHeld() {
+        // FOR UPDATE SKIP LOCKED only protects other pollers while a transaction is open.
+        // Calling the @Transactional drainOnce() from inside the same bean would bypass the
+        // proxy, so the tick has to open the transaction itself.
+        AtomicBoolean inTransaction = new AtomicBoolean(false);
+        AtomicBoolean claimedInTransaction = new AtomicBoolean(false);
+        TransactionOperations recording = new TransactionOperations() {
+            @Override
+            public <T> T execute(TransactionCallback<T> action) {
+                inTransaction.set(true);
+                try {
+                    return action.doInTransaction(null);
+                } finally {
+                    inTransaction.set(false);
+                }
+            }
+        };
+        OutboxPublisher transactional = new OutboxPublisher(outbox, kafkaTemplate, deliveryService, properties,
+                Clock.fixed(NOW, ZoneOffset.UTC), recording);
+        when(outbox.claimPendingBatch(anyInt())).thenAnswer(call -> {
+            claimedInTransaction.set(inTransaction.get());
+            return List.of();
+        });
+
+        transactional.publishPending();
+
+        assertThat(claimedInTransaction).isTrue();
     }
 }

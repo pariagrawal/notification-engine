@@ -46,7 +46,7 @@ public class Notification {
      * Caller-supplied de-duplication key. Unique in the database, which is the durable
      * backstop behind the Ignite idempotency cache.
      */
-    @Column(name = "idempotency_key", nullable = false, length = 128, updatable = false)
+    @Column(name = "idempotency_key", nullable = false, length = 160, updatable = false)
     private String idempotencyKey;
 
     @Column(length = 320)

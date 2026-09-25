@@ -15,13 +15,21 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionOperations;
 
 /**
  * Drains the transactional outbox onto Kafka.
  *
  * <p>Every node runs this. Safety comes from the claim query's
  * {@code for update skip locked}: concurrent pollers take disjoint batches instead of
- * fighting over the same rows.
+ * fighting over the same rows. The locks only mean something while a transaction is open,
+ * so each poll runs claim, publish and status updates inside one transaction started
+ * explicitly through {@link TransactionOperations}. (Calling the {@code @Transactional}
+ * {@link #drainOnce} from {@link #publishPending} would bypass Spring's proxy, and the
+ * locks would be released the moment the claim query returned.)
+ *
+ * <p>The trade-off is that the transaction stays open while the batch is sent to Kafka.
+ * {@code notification.outbox.batch-size} bounds how long that can be.
  *
  * <p>The guarantee is at-least-once. A crash between a successful send and the status
  * update republishes the event, which is fine — consumers de-duplicate on the
@@ -39,23 +47,26 @@ public class OutboxPublisher {
     private final DeliveryService deliveryService;
     private final NotificationProperties properties;
     private final Clock clock;
+    private final TransactionOperations transactions;
 
     public OutboxPublisher(OutboxEventRepository outbox,
                            KafkaTemplate<String, String> kafkaTemplate,
                            DeliveryService deliveryService,
                            NotificationProperties properties,
-                           Clock clock) {
+                           Clock clock,
+                           TransactionOperations transactions) {
         this.outbox = outbox;
         this.kafkaTemplate = kafkaTemplate;
         this.deliveryService = deliveryService;
         this.properties = properties;
         this.clock = clock;
+        this.transactions = transactions;
     }
 
     @Scheduled(fixedDelayString = "${notification.outbox.poll-delay:500ms}")
     public void publishPending() {
         try {
-            drainOnce();
+            transactions.execute(status -> drainOnce());
         } catch (RuntimeException ex) {
             // Never let the scheduler's thread die on a transient database blip.
             log.error("outbox poll failed, will retry on the next tick", ex);
@@ -65,9 +76,10 @@ public class OutboxPublisher {
     /**
      * Claims and publishes one batch.
      *
-     * <p>Transactional so the row locks taken by the claim query are held until the
-     * statuses are written — that is what keeps another node from picking up the same
-     * events mid-publish.
+     * <p>Must run inside a transaction so the row locks taken by the claim query are held
+     * until the statuses are written; that is what keeps another node from picking up the
+     * same events mid-publish. {@link #publishPending} provides one explicitly, and the
+     * annotation covers callers from other beans.
      */
     @Transactional
     public int drainOnce() {
@@ -93,8 +105,6 @@ public class OutboxPublisher {
             event.setPublishedAt(clock.instant());
             event.setLastError(null);
             outbox.save(event);
-            deliveryService.markPublished(event.getAggregateId());
-            return true;
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
             recordFailure(event, ex);
@@ -103,6 +113,16 @@ public class OutboxPublisher {
             recordFailure(event, ex);
             return false;
         }
+        // The event is on Kafka. Advancing the notification to PUBLISHED is informational
+        // (the consumer may already have marked it SENT), so failing here must not count
+        // as a failed publish or retry the send.
+        try {
+            deliveryService.markPublished(event.getAggregateId());
+        } catch (RuntimeException ex) {
+            log.warn("outbox event {} published, but notification {} could not be marked PUBLISHED: {}",
+                    event.getId(), event.getAggregateId(), ex.toString());
+        }
+        return true;
     }
 
     /**

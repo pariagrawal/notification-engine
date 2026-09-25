@@ -18,34 +18,47 @@ import java.util.Optional;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionOperations;
 
 /**
  * Runs one delivery attempt and records what happened.
  *
  * <p>Shared by all three channel consumers: the only thing that differs per channel is
  * which provider handles the message, and {@link ProviderRegistry} resolves that.
+ *
+ * <p>{@link #deliver} runs its database steps through {@link TransactionOperations}
+ * rather than calling the {@code @Transactional} methods below directly. A call from one
+ * method of a bean to another never passes through Spring's proxy, so the annotations
+ * would silently do nothing on that path. The annotations stay for callers in other beans
+ * ({@code markPublished} from the outbox, {@code markDeadLettered} from the DLT auditor).
  */
 @Service
 public class DeliveryService {
 
     private static final Logger log = LoggerFactory.getLogger(DeliveryService.class);
     private static final int MAX_ERROR_LENGTH = 2000;
+    private static final int RECORD_SUCCESS_ATTEMPTS = 3;
 
     private final NotificationRepository notifications;
     private final DeliveryAttemptRepository attempts;
     private final ProviderRegistry providers;
     private final Clock clock;
+    private final TransactionOperations transactions;
 
     public DeliveryService(NotificationRepository notifications,
                            DeliveryAttemptRepository attempts,
                            ProviderRegistry providers,
-                           Clock clock) {
+                           Clock clock,
+                           TransactionOperations transactions) {
         this.notifications = notifications;
         this.attempts = attempts;
         this.providers = providers;
         this.clock = clock;
+        this.transactions = transactions;
     }
 
     /**
@@ -58,29 +71,65 @@ public class DeliveryService {
      * @throws PermanentDeliveryException to skip the retries and dead-letter immediately
      */
     public void deliver(NotificationMessage message) {
-        Optional<Notification> claimed = beginAttempt(message.notificationId());
-        if (claimed.isEmpty()) {
+        Optional<Notification> claimed = transactions.execute(status -> beginAttempt(message.notificationId()));
+        if (claimed == null || claimed.isEmpty()) {
             return;
         }
         Notification notification = claimed.get();
         NotificationProvider provider = providers.require(message.channel());
 
+        // Only the provider call is inside this try. Anything that fails here genuinely
+        // did not deliver, so recording a failure and asking Kafka to retry is safe.
+        DeliveryResult result;
         try {
-            DeliveryResult result = provider.send(message);
-            recordSuccess(notification.getId(), notification.getAttempts(), provider.name(), result);
-            log.info("notification {} delivered via {} in {}ms",
-                    notification.getId(), provider.name(), result.latencyMs());
+            result = provider.send(message);
         } catch (PermanentDeliveryException ex) {
-            recordFailure(notification.getId(), notification.getAttempts(),
-                    DeliveryOutcome.PERMANENT_FAILURE, provider.name(), ex.getMessage());
+            transactions.executeWithoutResult(status -> recordFailure(notification.getId(),
+                    notification.getAttempts(), DeliveryOutcome.PERMANENT_FAILURE, provider.name(), ex.getMessage()));
             throw ex;
         } catch (RuntimeException ex) {
-            recordFailure(notification.getId(), notification.getAttempts(),
-                    DeliveryOutcome.TRANSIENT_FAILURE, provider.name(), ex.getMessage());
+            transactions.executeWithoutResult(status -> recordFailure(notification.getId(),
+                    notification.getAttempts(), DeliveryOutcome.TRANSIENT_FAILURE, provider.name(), ex.getMessage()));
             throw ex instanceof TransientDeliveryException retryable
                     ? retryable
                     : new TransientDeliveryException("delivery failed: " + ex.getMessage(), ex);
         }
+
+        // The provider has accepted the message. From here on, a failure must NOT be
+        // rethrown: Kafka would redeliver and the user would get the same message twice.
+        // If recording SENT fails, the notification is left in its previous status and an
+        // operator reconciles it from this log line and the provider's message id.
+        // Only this bookkeeping step is retried, never the send: a concurrent status update
+        // (the outbox flagging PUBLISHED) can trip the @Version check, and a fresh read
+        // resolves it.
+        DeliveryResult delivered = result;
+        for (int attempt = 1; ; attempt++) {
+            try {
+                transactions.executeWithoutResult(status -> recordSuccess(notification.getId(),
+                        notification.getAttempts(), provider.name(), delivered));
+                break;
+            } catch (OptimisticLockingFailureException ex) {
+                if (attempt < RECORD_SUCCESS_ATTEMPTS) {
+                    continue;
+                }
+                logUnrecordedDelivery(notification, provider, delivered, ex);
+                return;
+            } catch (RuntimeException ex) {
+                logUnrecordedDelivery(notification, provider, delivered, ex);
+                return;
+            }
+        }
+        log.info("notification {} delivered via {} in {}ms",
+                notification.getId(), provider.name(), delivered.latencyMs());
+    }
+
+    private void logUnrecordedDelivery(Notification notification,
+                                       NotificationProvider provider,
+                                       DeliveryResult delivered,
+                                       RuntimeException ex) {
+        log.error("notification {} WAS delivered via {} (provider message id {}) but recording SENT failed;"
+                        + " not retrying, to avoid a duplicate send",
+                notification.getId(), provider.name(), delivered.providerMessageId(), ex);
     }
 
     /**
@@ -153,11 +202,22 @@ public class DeliveryService {
                 .build());
     }
 
-    /** Marks a notification as parked on a dead-letter topic; no further retries will run. */
+    /**
+     * Marks a notification as parked on a dead-letter topic; no further retries will run.
+     *
+     * <p>Never overwrites {@code SENT} or {@code SUPPRESSED}. Kafka is at-least-once, so a
+     * duplicate copy of a message can exhaust its retries after another copy was already
+     * delivered; the notification did reach the user, and its status must say so.
+     */
     @Transactional
     public void markDeadLettered(UUID notificationId, String reason) {
         Instant now = clock.instant();
         notifications.findById(notificationId).ifPresent(notification -> {
+            NotificationStatus current = notification.getStatus();
+            if (current == NotificationStatus.SENT || current == NotificationStatus.SUPPRESSED) {
+                log.warn("ignoring dead letter for notification {}: already {} ({})", notificationId, current, reason);
+                return;
+            }
             notification.setStatus(NotificationStatus.DEAD_LETTERED);
             notification.setFailureReason(truncate(reason));
             notification.setUpdatedAt(now);
@@ -165,8 +225,15 @@ public class DeliveryService {
         });
     }
 
-    /** Records that the outbox handed the notification to Kafka. */
-    @Transactional
+    /**
+     * Records that the outbox handed the notification to Kafka.
+     *
+     * <p>Runs in its own short transaction, not the outbox poller's batch transaction. If
+     * it joined the batch, the {@code PUBLISHED} write would sit uncommitted while the rest
+     * of the batch was sent, racing the consumer's {@code SENT} write on the notification's
+     * {@code @Version} and rolling back the whole batch when it lost.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void markPublished(UUID notificationId) {
         Instant now = clock.instant();
         notifications.findById(notificationId).ifPresent(notification -> {

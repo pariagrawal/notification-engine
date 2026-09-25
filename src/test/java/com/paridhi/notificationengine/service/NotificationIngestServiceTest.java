@@ -102,7 +102,7 @@ class NotificationIngestServiceTest {
         assertThat(saved.getSubject()).isEqualTo("Hi Ada");
         assertThat(saved.getBody()).isEqualTo("Body for Ada");
         assertThat(saved.getRecipient()).isEqualTo("ada@example.com");
-        assertThat(saved.getIdempotencyKey()).isEqualTo("key-1");
+        assertThat(saved.getIdempotencyKey()).isEqualTo("user-1:key-1");
         assertThat(saved.getCreatedAt()).isEqualTo(NOW);
     }
 
@@ -138,7 +138,7 @@ class NotificationIngestServiceTest {
     }
 
     @Test
-    void rejectsACallerOverTheirQuotaBeforeTouchingAnyState() {
+    void rejectsACallerOverTheirQuotaAndReleasesTheClaim() {
         when(rateLimiter.tryAcquire(anyString(), any()))
                 .thenReturn(new RateLimiterService.Decision(false, 5, 0, Duration.ofSeconds(30)));
 
@@ -146,16 +146,61 @@ class NotificationIngestServiceTest {
                 .isInstanceOf(RateLimitExceededException.class)
                 .hasMessageContaining("user-1");
 
-        // Nothing was claimed, so a later legitimate retry with the same key still works.
-        verify(idempotency, never()).claim(anyString(), any());
+        // Released, so a later legitimate retry with the same key still works.
+        verify(idempotency).release("user-1:key-1");
         verify(writer, never()).saveQueued(any(), any(), anyString());
+    }
+
+    @Test
+    void aReplayIsAnsweredEvenWhenTheCallerIsOverQuota() {
+        // A client retrying after a timeout must get its original notification back, not a
+        // 429, and the retry must not spend quota.
+        UUID originalId = UUID.randomUUID();
+        Notification original = Notification.builder().id(originalId).status(NotificationStatus.SENT).build();
+        when(idempotency.claim(eq("user-1:key-1"), any())).thenReturn(Optional.of(originalId));
+        when(notifications.findById(originalId)).thenReturn(Optional.of(original));
+        when(rateLimiter.tryAcquire(anyString(), any()))
+                .thenReturn(new RateLimiterService.Decision(false, 5, 0, Duration.ofSeconds(30)));
+
+        NotificationIngestService.IngestResult result = service.ingest(request(), "key-1");
+
+        assertThat(result.duplicate()).isTrue();
+        verify(rateLimiter, never()).tryAcquire(anyString(), any());
+    }
+
+    @Test
+    void scopesIdempotencyKeysToTheUser() {
+        // Two users choosing the same key must never see each other's notifications.
+        SendNotificationRequest otherUser = new SendNotificationRequest("user-2", Channel.EMAIL, "welcome",
+                Map.of("firstName", "Bo"), "bo@example.com", null, null);
+
+        service.ingest(request(), "order-42");
+        service.ingest(otherUser, "order-42");
+
+        verify(idempotency).claim(eq("user-1:order-42"), any());
+        verify(idempotency).claim(eq("user-2:order-42"), any());
+    }
+
+    @Test
+    void releasesTheClaimWhenTheDatabaseRejectsTheInsert() {
+        // Without the release, a failed insert would leave the key claimed in the cache,
+        // pointing at a notification that was never written, and every retry would get
+        // 409 until the TTL ran out.
+        when(writer.saveQueued(any(), any(), anyString()))
+                .thenThrow(new DataIntegrityViolationException("value too long"));
+        when(notifications.findByIdempotencyKey("user-1:key-1")).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.ingest(request(), "key-1"))
+                .isInstanceOf(DataIntegrityViolationException.class);
+
+        verify(idempotency).release("user-1:key-1");
     }
 
     @Test
     void returnsTheOriginalNotificationWhenTheIdempotencyKeyRepeats() {
         UUID originalId = UUID.randomUUID();
         Notification original = Notification.builder().id(originalId).status(NotificationStatus.SENT).build();
-        when(idempotency.claim(eq("key-1"), any())).thenReturn(Optional.of(originalId));
+        when(idempotency.claim(eq("user-1:key-1"), any())).thenReturn(Optional.of(originalId));
         when(notifications.findById(originalId)).thenReturn(Optional.of(original));
 
         NotificationIngestService.IngestResult result = service.ingest(request(), "key-1");
@@ -168,7 +213,7 @@ class NotificationIngestServiceTest {
     @Test
     void reportsAConflictWhenTheMatchingRequestHasNotCommittedYet() {
         UUID inFlightId = UUID.randomUUID();
-        when(idempotency.claim(eq("key-1"), any())).thenReturn(Optional.of(inFlightId));
+        when(idempotency.claim(eq("user-1:key-1"), any())).thenReturn(Optional.of(inFlightId));
         when(notifications.findById(inFlightId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.ingest(request(), "key-1"))
@@ -183,19 +228,23 @@ class NotificationIngestServiceTest {
         Notification original = Notification.builder().id(UUID.randomUUID()).build();
         when(writer.saveQueued(any(), any(), anyString()))
                 .thenThrow(new DataIntegrityViolationException("uq_notification_idempotency_key"));
-        when(notifications.findByIdempotencyKey("key-1")).thenReturn(Optional.of(original));
+        when(notifications.findByIdempotencyKey("user-1:key-1")).thenReturn(Optional.of(original));
 
         NotificationIngestService.IngestResult result = service.ingest(request(), "key-1");
 
         assertThat(result.duplicate()).isTrue();
         assertThat(result.notification()).isSameAs(original);
+        // The cache is re-seeded with the original id, so the next replay skips the
+        // rate limiter and the database round trip.
+        verify(idempotency).release("user-1:key-1");
+        verify(idempotency).claim("user-1:key-1", original.getId());
     }
 
     @Test
     void rethrowsWhenTheConstraintFiredButNoRowCanBeFound() {
         when(writer.saveQueued(any(), any(), anyString()))
                 .thenThrow(new DataIntegrityViolationException("some other constraint"));
-        when(notifications.findByIdempotencyKey("key-1")).thenReturn(Optional.empty());
+        when(notifications.findByIdempotencyKey("user-1:key-1")).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.ingest(request(), "key-1"))
                 .isInstanceOf(DataIntegrityViolationException.class);
@@ -210,7 +259,7 @@ class NotificationIngestServiceTest {
 
         assertThatThrownBy(() -> service.ingest(request(), "key-1")).isInstanceOf(NotFoundException.class);
 
-        verify(idempotency).release("key-1");
+        verify(idempotency).release("user-1:key-1");
     }
 
     @Test

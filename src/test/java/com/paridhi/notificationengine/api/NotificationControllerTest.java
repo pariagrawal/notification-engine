@@ -5,6 +5,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
@@ -207,5 +208,29 @@ class NotificationControllerTest {
 
         verify(queryService).search(isNull(), isNull(), isNull(),
                 org.mockito.ArgumentMatchers.argThat(page -> page.getPageSize() == 200));
+    }
+
+    @Test
+    void rejectsAnOverlongIdempotencyKeyWith400() throws Exception {
+        mockMvc.perform(post("/api/v1/notifications")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("Idempotency-Key", "k".repeat(65))
+                        .content(VALID_BODY))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("BAD_REQUEST"));
+    }
+
+    @Test
+    void answersAnUnsupportedContentTypeWith415RatherThan500() throws Exception {
+        mockMvc.perform(post("/api/v1/notifications").contentType(MediaType.TEXT_PLAIN).content("hello"))
+                .andExpect(status().isUnsupportedMediaType())
+                .andExpect(jsonPath("$.code").value("UNSUPPORTED_MEDIA_TYPE"));
+    }
+
+    @Test
+    void answersAWrongHttpMethodWith405RatherThan500() throws Exception {
+        mockMvc.perform(delete("/api/v1/notifications"))
+                .andExpect(status().isMethodNotAllowed())
+                .andExpect(header().exists("Allow"));
     }
 }

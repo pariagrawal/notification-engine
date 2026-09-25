@@ -12,9 +12,10 @@ import org.springframework.stereotype.Component;
  * outage would otherwise be invisible from outside, with notifications still flowing
  * while quotas quietly stop being enforced.
  *
- * <p>Reported as {@code OUT_OF_SERVICE} rather than {@code DOWN}: the engine is still
- * accepting and delivering notifications, so a load balancer should not pull the instance
- * out of rotation over it.
+ * <p>Reported as {@code UP} with {@code degraded: true} rather than {@code DOWN} or
+ * {@code OUT_OF_SERVICE}. Spring Boot answers both of those with HTTP 503, and a load
+ * balancer would then pull every instance out of rotation at once over a cache the engine
+ * is designed to run without. The detail keeps the degradation visible to monitoring.
  */
 @Component("ignite")
 public class IgniteHealthIndicator implements HealthIndicator {
@@ -28,7 +29,8 @@ public class IgniteHealthIndicator implements HealthIndicator {
     @Override
     public Health health() {
         if (!caches.connected()) {
-            return Health.outOfService()
+            return Health.up()
+                    .withDetail("degraded", true)
                     .withDetail("cache", caches.idempotencyCacheName())
                     .withDetail("impact", "de-duplication falls back to the database; rate limiting is off")
                     .build();
@@ -40,7 +42,11 @@ public class IgniteHealthIndicator implements HealthIndicator {
             cache.size();
             return Health.up().withDetail("cache", cache.getName()).build();
         } catch (RuntimeException ex) {
-            return Health.outOfService().withException(ex).build();
+            return Health.up()
+                    .withDetail("degraded", true)
+                    .withDetail("impact", "de-duplication falls back to the database; rate limiting is off")
+                    .withException(ex)
+                    .build();
         }
     }
 }

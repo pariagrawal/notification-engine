@@ -23,12 +23,15 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
 
 @RestController
 @RequestMapping("/api/v1/notifications")
 public class NotificationController {
 
     private static final int MAX_PAGE_SIZE = 200;
+    /** Stored as {@code userId:key}; 64 + 1 + 64 fits the 160-character column. */
+    static final int MAX_IDEMPOTENCY_KEY_LENGTH = 64;
 
     private final NotificationIngestService ingestService;
     private final NotificationQueryService queryService;
@@ -51,6 +54,10 @@ public class NotificationController {
             @Valid @RequestBody SendNotificationRequest request,
             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
 
+        if (idempotencyKey != null && idempotencyKey.length() > MAX_IDEMPOTENCY_KEY_LENGTH) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Idempotency-Key must be at most %d characters".formatted(MAX_IDEMPOTENCY_KEY_LENGTH));
+        }
         NotificationIngestService.IngestResult result = ingestService.ingest(request, idempotencyKey);
         NotificationResponse body = NotificationResponse.of(result.notification(), result.duplicate());
         return ResponseEntity

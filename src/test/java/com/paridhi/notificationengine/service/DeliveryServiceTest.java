@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -36,6 +37,8 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.transaction.support.TransactionOperations;
 
 @ExtendWith(MockitoExtension.class)
 @MockitoSettings(strictness = Strictness.LENIENT)
@@ -58,7 +61,7 @@ class DeliveryServiceTest {
         when(provider.channel()).thenReturn(Channel.EMAIL);
         when(provider.name()).thenReturn("email-provider");
         service = new DeliveryService(notifications, attempts, new ProviderRegistry(List.of(provider)),
-                Clock.fixed(NOW, ZoneOffset.UTC));
+                Clock.fixed(NOW, ZoneOffset.UTC), TransactionOperations.withoutTransaction());
         when(notifications.save(any())).thenAnswer(call -> call.getArgument(0));
     }
 
@@ -226,5 +229,53 @@ class DeliveryServiceTest {
         ArgumentCaptor<DeliveryAttempt> attempt = ArgumentCaptor.forClass(DeliveryAttempt.class);
         verify(attempts).save(attempt.capture());
         assertThat(attempt.getValue().getError()).hasSize(2000);
+    }
+
+    @Test
+    void neverRetriesADeliveryTheProviderAlreadyAccepted() {
+        // The send succeeded but writing SENT failed. Rethrowing would make Kafka
+        // redeliver, and the user would get the same email twice.
+        stored(NotificationStatus.PUBLISHED, 0);
+        when(provider.send(any())).thenReturn(new DeliveryResult("msg-1", 5L));
+        when(attempts.save(any())).thenThrow(new DataAccessResourceFailureException("database went away"));
+
+        service.deliver(message());
+
+        verify(provider, times(1)).send(any());
+    }
+
+    @Test
+    void retriesOnlyTheBookkeepingWhenAConcurrentUpdateWinsTheVersionCheck() {
+        Notification notification = stored(NotificationStatus.PUBLISHED, 0);
+        when(provider.send(any())).thenReturn(new DeliveryResult("msg-1", 5L));
+        when(attempts.save(any()))
+                .thenThrow(new org.springframework.dao.OptimisticLockingFailureException("stale version"))
+                .thenAnswer(call -> call.getArgument(0));
+
+        service.deliver(message());
+
+        verify(provider, times(1)).send(any());
+        assertThat(notification.getStatus()).isEqualTo(NotificationStatus.SENT);
+    }
+
+    @Test
+    void markDeadLetteredNeverOverwritesADeliveredNotification() {
+        // A duplicate copy of the message can exhaust its retries after another copy was
+        // delivered; the user did get it, so the status must stay SENT.
+        Notification notification = stored(NotificationStatus.SENT, 1);
+
+        service.markDeadLettered(ID, "TransientDeliveryException: vendor down");
+
+        assertThat(notification.getStatus()).isEqualTo(NotificationStatus.SENT);
+        assertThat(notification.getFailureReason()).isNull();
+    }
+
+    @Test
+    void markDeadLetteredLeavesASuppressedNotificationAlone() {
+        Notification notification = stored(NotificationStatus.SUPPRESSED, 0);
+
+        service.markDeadLettered(ID, "whatever");
+
+        assertThat(notification.getStatus()).isEqualTo(NotificationStatus.SUPPRESSED);
     }
 }
