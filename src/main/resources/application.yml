@@ -1,0 +1,123 @@
+spring:
+  application:
+    name: notification-engine
+
+  datasource:
+    url: ${POSTGRES_URL:jdbc:postgresql://localhost:5432/notifications}
+    username: ${POSTGRES_USER:notifications}
+    password: ${POSTGRES_PASSWORD:notifications}
+    hikari:
+      pool-size: 10
+
+  jpa:
+    open-in-view: false
+    # Flyway owns the schema; Hibernate only checks that the entities still match it.
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # acks=all plus idempotence is what makes the outbox's "published" flag honest:
+      # the send is only acknowledged once every in-sync replica has the record, and a
+      # producer retry cannot duplicate it.
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+      retries: 10
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      auto-offset-reset: earliest
+      # Offsets are committed by the container after the listener returns, so a crash
+      # mid-delivery redelivers rather than silently skipping.
+      enable-auto-commit: false
+    listener:
+      ack-mode: record
+      missing-topics-fatal: false
+
+notification:
+  ignite:
+    addresses: ${IGNITE_ADDRESSES:localhost:10800}
+    timeout: 2s
+    partition-aware: true
+    retry-limit: 2
+    idempotency-cache: notification-idempotency
+    rate-limit-cache: notification-rate-limit
+    # Zero is fine for the single-node dev cluster in docker-compose; raise it in
+    # production or losing a node drops live counters and in-flight idempotency claims.
+    backups: 0
+
+  kafka:
+    inbound-topic: notifications.inbound
+    channel-topic-prefix: "notifications."
+    dlt-suffix: ".DLT"
+    partitions: 3
+    replication-factor: 1
+    auto-create-topics: true
+    concurrency:
+      email: 3
+      sms: 3
+      push: 3
+
+  outbox:
+    enabled: true
+    poll-delay: 500ms
+    batch-size: 100
+    max-attempts: 10
+    retention: 7d
+
+  rate-limit:
+    enabled: true
+    window: 1m
+    default-limit: 20
+    limits:
+      SMS: 5
+      EMAIL: 20
+      PUSH: 60
+
+  idempotency:
+    enabled: true
+    ttl: 24h
+
+  retry:
+    # Four deliveries in total: the first plus three retries at roughly 1s, 2s, 4s.
+    max-attempts: 4
+    initial-backoff: 1s
+    multiplier: 2.0
+    max-backoff: 30s
+
+  preferences:
+    default-enabled: true
+    default-locale: en
+    default-time-zone: UTC
+
+  providers:
+    # Raise this to exercise the retry and dead-letter paths against the simulated
+    # providers, e.g. 0.5 to fail half of all sends with a retryable error.
+    simulated-failure-rate: 0.0
+    simulated-latency: 0ms
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+
+logging:
+  level:
+    com.paridhi.notificationengine: INFO
