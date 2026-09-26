@@ -104,6 +104,10 @@ notification:
     default-time-zone: UTC
 
   providers:
+    email:
+      # simulated: log instead of sending (default). smtp: send real mail via spring.mail.*;
+      # the gmail profile (application-gmail.yml) switches this on.
+      mode: simulated
     # Raise this to exercise the retry and dead-letter paths against the simulated
     # providers, e.g. 0.5 to fail half of all sends with a retryable error.
     simulated-failure-rate: 0.0

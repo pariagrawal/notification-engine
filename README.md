@@ -145,7 +145,7 @@ curl http://localhost:8080/api/v1/notifications/<id>
 curl http://localhost:8080/api/v1/notifications/<id>/attempts
 ```
 
-Delivery is logged rather than actually sent — see [Providers](#providers).
+By default delivery is logged rather than actually sent; to receive real email, see [Sending real email (Gmail)](#sending-real-email-gmail).
 
 ### See the failure handling work
 
@@ -270,7 +270,7 @@ original, and the engine recovered on its own when the cluster came back — no 
 
 ## Providers
 
-The three shipped providers log instead of sending, and validate recipients the way a real
+By default the three shipped providers log instead of sending, and validate recipients the way a real
 vendor would — an address failing `EmailProvider`'s check is a *permanent* failure, because
 no number of retries makes a malformed address valid.
 
@@ -290,6 +290,27 @@ worth retrying and `PermanentDeliveryException` for anything that is not — tha
 distinction is what drives the retry-versus-dead-letter decision. Registering two providers
 for one channel fails at startup rather than letting delivery depend on bean ordering.
 
+### Sending real email (Gmail)
+
+Email can go out for real through `SmtpEmailProvider`, which the `gmail` profile switches
+on in place of the simulated one. Nothing else in the pipeline changes.
+
+1. Turn on 2-Step Verification for your Google account, then create an **app password**
+   at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
+   (Security → 2-Step Verification → App passwords). Gmail rejects your normal password
+   over SMTP. Paste the 16 characters without spaces.
+2. Run with the credentials in the environment, never in a committed file:
+
+   ```bash
+   export MAIL_USERNAME=you@gmail.com
+   export MAIL_PASSWORD='your 16-character app password'
+   SPRING_PROFILES_ACTIVE=gmail ./mvnw spring-boot:run
+   ```
+
+A rejected login is treated as a *permanent* failure (dead-lettered at once rather than
+retried, so a bad password does not lock the account); a timeout or refused connection is
+*transient* and retried with backoff.
+
 ## Configuration
 
 Everything lives under `notification.*` in `application.yml`. The knobs worth knowing:
@@ -308,7 +329,8 @@ Everything lives under `notification.*` in `application.yml`. The knobs worth kn
 | `notification.ignite.reconnect-cooldown` | `10s` | Wait before retrying a failed Ignite connection |
 
 Connection settings come from `POSTGRES_URL`, `IGNITE_ADDRESSES`, and
-`KAFKA_BOOTSTRAP_SERVERS`.
+`KAFKA_BOOTSTRAP_SERVERS`; real email additionally needs `MAIL_USERNAME` and
+`MAIL_PASSWORD` with the `gmail` profile.
 
 ### A note on the Ignite JVM flags
 

@@ -1,0 +1,38 @@
+# Real email through Gmail's SMTP server. Activate with:
+#
+#   export MAIL_USERNAME=you@gmail.com
+#   export MAIL_PASSWORD=<16-character Gmail app password>
+#   SPRING_PROFILES_ACTIVE=gmail ./mvnw spring-boot:run
+#
+# Credentials come from the environment only; never commit them to this file.
+# Gmail needs an *app password* (Google Account > Security > 2-Step Verification >
+# App passwords), not your normal password.
+
+spring:
+  mail:
+    host: smtp.gmail.com
+    port: 587
+    username: ${MAIL_USERNAME}
+    password: ${MAIL_PASSWORD}
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+      mail.smtp.starttls.required: true
+      # Bounded, so a hung SMTP connection turns into a retryable failure instead of
+      # stalling the email consumer thread.
+      mail.smtp.connectiontimeout: 5000
+      mail.smtp.timeout: 5000
+      mail.smtp.writetimeout: 5000
+
+notification:
+  providers:
+    email:
+      mode: smtp
+      from: ${MAIL_FROM:${MAIL_USERNAME}}
+
+management:
+  health:
+    # Delivery problems already show up per notification (status and attempts). A mail
+    # check in /actuator/health would log in to Gmail on every probe.
+    mail:
+      enabled: false
