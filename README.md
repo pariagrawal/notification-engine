@@ -145,7 +145,7 @@ curl http://localhost:8080/api/v1/notifications/<id>
 curl http://localhost:8080/api/v1/notifications/<id>/attempts
 ```
 
-By default delivery is logged rather than actually sent; to receive real email, see [Sending real email (Gmail)](#sending-real-email-gmail).
+By default delivery is logged rather than actually sent; to receive real email, see [Sending real email (Gmail)](#sending-real-email-gmail) or [(Brevo)](#sending-real-email-brevo).
 
 ### See the failure handling work
 
@@ -314,18 +314,55 @@ retried, so a bad password does not lock the account); a timeout or refused conn
 ### Sending real email (Brevo)
 
 The `brevo` profile sends through Brevo's relay (`smtp-relay.brevo.com:587`, STARTTLS)
-instead. Take the SMTP login and an SMTP key from Brevo → SMTP & API, and verify the
-address you send from under Senders & IP. Brevo rejects unverified senders, and the
-SMTP login is not a mailbox, so `MAIL_FROM` is required:
+instead. Brevo's free plan includes SMTP (about 300 emails a day).
+
+1. **Verify a sender.** Under Senders, add the address mail will come from and click the
+   confirmation link Brevo emails you. Brevo blocks sending until the sender is verified.
+2. **Get the SMTP credentials** from Settings → SMTP & API → SMTP. The **Login** looks like
+   `xxxx@smtp-brevo.com` and is *not* your account email; using the account email fails
+   with `535 Authentication failed`. Generate an **SMTP key** (`xsmtpsib-…`); that is the
+   password.
+3. **Authorize your public IP** under Security → Authorized IPs, or Brevo answers
+   `525 Unauthorized IP address`. Find it with `curl https://api.ipify.org`; home IPs
+   change, so add it again when yours does.
+4. Run with the credentials in the environment. `MAIL_FROM` is required, because the
+   SMTP login is not a mailbox:
+
+   ```bash
+   export MAIL_USERNAME=xxxx@smtp-brevo.com     # the SMTP Login, not your email
+   export MAIL_PASSWORD='xsmtpsib-...'          # the SMTP key
+   export MAIL_FROM=you@example.com             # a verified Brevo sender
+   SPRING_PROFILES_ACTIVE=brevo ./mvnw spring-boot:run
+   ```
+
+   Keeping these in the gitignored `.env` works too: `set -a; source .env; set +a` first.
+
+To try it, send a notification as in [Send something](#send-something). A request can
+override the stored destination with `recipient`:
 
 ```bash
-export MAIL_USERNAME=xxxx@smtp-brevo.com
-export MAIL_PASSWORD='xsmtpsib-...'
-export MAIL_FROM=you@example.com
-SPRING_PROFILES_ACTIVE=brevo ./mvnw spring-boot:run
+curl -X POST http://localhost:8080/api/v1/notifications \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: brevo-test-$(date +%s)" \
+  -d '{"userId":"demo","channel":"EMAIL","templateCode":"welcome",
+       "recipient":"someone@example.com",
+       "data":{"firstName":"Demo","product":"Notification Engine"}}'
 ```
 
-Keeping these in the gitignored `.env` works too: `set -a; source .env; set +a` first.
+The status reaches `SENT` and the log shows `[smtp] sent notification <id> to … in ~1500ms`.
+First emails from a new Brevo sender often land in Spam or Promotions, so look there before
+assuming a failure.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `535 Authentication failed` | Account email used as the SMTP login | Use the Brevo **Login** (`…@smtp-brevo.com`) |
+| `525 Unauthorized IP address` | Sending IP not authorized | Add your public IP under Security → Authorized IPs |
+| App fails at startup asking for a sender or password | `MAIL_FROM` or `MAIL_PASSWORD` unset | Export them, or source `.env` |
+| App won't start / class version error | Running on a JDK older than 17 | Point `JAVA_HOME` at JDK 17 |
+
+Rejected logins are permanent failures, as with Gmail: the notification is dead-lettered to
+`notifications.email.DLT` straight away with Brevo's reason recorded, instead of being
+retried. Fix the credential or IP, then send again.
 
 ## Configuration
 
