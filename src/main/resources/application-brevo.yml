@@ -1,0 +1,37 @@
+# Real email through Brevo's SMTP relay. Activate with:
+#
+#   export MAIL_USERNAME=<your Brevo SMTP login, e.g. xxxx@smtp-brevo.com>
+#   export MAIL_PASSWORD=<Brevo SMTP key, starts with xsmtpsib->
+#   export MAIL_FROM=<a sender address verified in Brevo>
+#   SPRING_PROFILES_ACTIVE=brevo ./mvnw spring-boot:run
+#
+# Credentials come from the environment only; never commit them to this file.
+# MAIL_FROM is required: the SMTP login is not a mailbox, and Brevo rejects mail from
+# senders that are not verified under Senders & IP.
+
+spring:
+  mail:
+    host: smtp-relay.brevo.com
+    port: 587
+    username: ${MAIL_USERNAME}
+    password: ${MAIL_PASSWORD}
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+      mail.smtp.starttls.required: true
+      # Bounded, so a hung SMTP connection turns into a retryable failure instead of
+      # stalling the email consumer thread.
+      mail.smtp.connectiontimeout: 5000
+      mail.smtp.timeout: 5000
+      mail.smtp.writetimeout: 5000
+
+notification:
+  providers:
+    email:
+      mode: smtp
+      from: ${MAIL_FROM}
+
+management:
+  health:
+    mail:
+      enabled: false

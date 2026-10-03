@@ -48,7 +48,7 @@ public class SmtpEmailProvider implements NotificationProvider {
         }
         // Fail at startup rather than dead-lettering every email with an auth error later.
         if (password == null || password.isBlank()) {
-            throw new IllegalStateException("SMTP email needs a password: set MAIL_PASSWORD (a Gmail app password)");
+            throw new IllegalStateException("SMTP email needs a password: set MAIL_PASSWORD (a Gmail app password or Brevo SMTP key)");
         }
         this.mailSender = mailSender;
         this.from = from;

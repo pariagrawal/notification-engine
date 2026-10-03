@@ -311,6 +311,22 @@ A rejected login is treated as a *permanent* failure (dead-lettered at once rath
 retried, so a bad password does not lock the account); a timeout or refused connection is
 *transient* and retried with backoff.
 
+### Sending real email (Brevo)
+
+The `brevo` profile sends through Brevo's relay (`smtp-relay.brevo.com:587`, STARTTLS)
+instead. Take the SMTP login and an SMTP key from Brevo → SMTP & API, and verify the
+address you send from under Senders & IP. Brevo rejects unverified senders, and the
+SMTP login is not a mailbox, so `MAIL_FROM` is required:
+
+```bash
+export MAIL_USERNAME=xxxx@smtp-brevo.com
+export MAIL_PASSWORD='xsmtpsib-...'
+export MAIL_FROM=you@example.com
+SPRING_PROFILES_ACTIVE=brevo ./mvnw spring-boot:run
+```
+
+Keeping these in the gitignored `.env` works too: `set -a; source .env; set +a` first.
+
 ## Configuration
 
 Everything lives under `notification.*` in `application.yml`. The knobs worth knowing:
@@ -330,7 +346,7 @@ Everything lives under `notification.*` in `application.yml`. The knobs worth kn
 
 Connection settings come from `POSTGRES_URL`, `IGNITE_ADDRESSES`, and
 `KAFKA_BOOTSTRAP_SERVERS`; real email additionally needs `MAIL_USERNAME` and
-`MAIL_PASSWORD` with the `gmail` profile.
+`MAIL_PASSWORD` with the `gmail` profile (plus `MAIL_FROM` with `brevo`).
 
 ### A note on the Ignite JVM flags
 
